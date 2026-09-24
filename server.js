@@ -1,0 +1,1531 @@
+require("dotenv").config();
+
+const crypto = require("crypto");
+const path = require("path");
+const cors = require("cors");
+const express = require("express");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+
+const app = express();
+const PORT = Number(process.env.PORT || 3000);
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "dev-admin-token";
+const GHOST_T_ADMIN_TOKEN = process.env.GHOST_T_ADMIN_TOKEN || "dev-ghost-t-admin-token";
+const DISCORD_BOT_API_TOKEN = process.env.DISCORD_BOT_API_TOKEN || "";
+const DEVICE_HASH_SECRET = process.env.DEVICE_HASH_SECRET || "dev-device-secret";
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+const DEFAULT_SCRIPT_URL = process.env.DEFAULT_SCRIPT_URL || "";
+const GHOST_T_SCRIPT_URL = process.env.GHOST_T_SCRIPT_URL || "";
+const MAX_SCRIPT_BYTES = Number(process.env.MAX_SCRIPT_BYTES || 5 * 1024 * 1024);
+const SCRIPT_URL_ALLOWLIST = String(process.env.SCRIPT_URL_ALLOWLIST || "")
+  .split(",")
+  .map((host) => host.trim().toLowerCase())
+  .filter(Boolean);
+const ALLOW_INSECURE_SCRIPT_URLS = process.env.ALLOW_INSECURE_SCRIPT_URLS === "true";
+const AUTO_DELETE_EXPIRED_KEYS = process.env.AUTO_DELETE_EXPIRED_KEYS !== "false";
+const DATABASE_URL = process.env.DATABASE_URL;
+const USE_POSTGRES = Boolean(DATABASE_URL);
+let dbReady;
+let sqliteDb;
+let pgPool;
+let dbInitFailed = false;
+let deletingExpiredKeys;
+
+if (ADMIN_TOKEN === "dev-admin-token") {
+  console.warn("ADMIN_TOKEN is not set. Using development token: dev-admin-token");
+}
+
+if (GHOST_T_ADMIN_TOKEN === "dev-ghost-t-admin-token") {
+  console.warn("GHOST_T_ADMIN_TOKEN is not set. Using development token: dev-ghost-t-admin-token");
+}
+
+if (DEVICE_HASH_SECRET === "dev-device-secret") {
+  console.warn("DEVICE_HASH_SECRET is not set. Set it before production use.");
+}
+
+const ADMIN_PRODUCTS = [
+  { token: ADMIN_TOKEN, product: "default", name: "GhostLua Key System", defaultScriptUrl: DEFAULT_SCRIPT_URL },
+  { token: GHOST_T_ADMIN_TOKEN, product: "ghost_t", name: "Ghost T Key System", defaultScriptUrl: GHOST_T_SCRIPT_URL || DEFAULT_SCRIPT_URL },
+];
+
+function assertProductionConfig() {
+  if (process.env.NODE_ENV !== "production") return;
+
+  const failures = [];
+  if (ADMIN_TOKEN === "dev-admin-token") failures.push("ADMIN_TOKEN");
+  if (GHOST_T_ADMIN_TOKEN === "dev-ghost-t-admin-token") failures.push("GHOST_T_ADMIN_TOKEN");
+  if (DEVICE_HASH_SECRET === "dev-device-secret") failures.push("DEVICE_HASH_SECRET");
+  if (!process.env.PUBLIC_BASE_URL && !process.env.VERCEL_PROJECT_PRODUCTION_URL) failures.push("PUBLIC_BASE_URL");
+
+  if (failures.length) {
+    throw new Error(`Production configuration is missing secure values for: ${failures.join(", ")}`);
+  }
+}
+
+assertProductionConfig();
+
+app.set("trust proxy", 1);
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(cors({ origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN }));
+app.use(express.json({ limit: "32kb" }));
+app.use(express.static(path.join(__dirname, "public")));
+
+const validateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const adminLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.use("/api/validate-key", validateLimiter);
+app.use("/api/loader", validateLimiter);
+app.use("/api", adminLimiter);
+
+if (USE_POSTGRES) {
+  const { Pool } = require("pg");
+  pgPool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: process.env.PGSSLMODE === "disable" ? false : { rejectUnauthorized: false },
+  });
+} else {
+  const sqlite3 = require("sqlite3").verbose();
+  sqliteDb = new sqlite3.Database(path.join(__dirname, "keys.db"));
+}
+
+function toPostgresSql(sql) {
+  let index = 0;
+  return sql.replace(/\?/g, () => `$${++index}`);
+}
+
+function run(sql, params = []) {
+  if (USE_POSTGRES) {
+    return pgPool.query(toPostgresSql(sql), params).then((result) => ({
+      changes: result.rowCount,
+      lastID: result.rows && result.rows[0] ? result.rows[0].id : undefined,
+    }));
+  }
+
+  return new Promise((resolve, reject) => {
+    sqliteDb.run(sql, params, function onRun(err) {
+      if (err) reject(err);
+      else resolve(this);
+    });
+  });
+}
+
+function get(sql, params = []) {
+  if (USE_POSTGRES) {
+    return pgPool.query(toPostgresSql(sql), params).then((result) => result.rows[0] || null);
+  }
+
+  return new Promise((resolve, reject) => {
+    sqliteDb.get(sql, params, (err, row) => {
+      if (err) reject(err);
+      else resolve(row);
+    });
+  });
+}
+
+function all(sql, params = []) {
+  if (USE_POSTGRES) {
+    return pgPool.query(toPostgresSql(sql), params).then((result) => result.rows);
+  }
+
+  return new Promise((resolve, reject) => {
+    sqliteDb.all(sql, params, (err, rows) => {
+      if (err) reject(err);
+      else resolve(rows);
+    });
+  });
+}
+
+async function initDatabase() {
+  if (!USE_POSTGRES) {
+    await run("PRAGMA foreign_keys = ON");
+  }
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS license_keys (
+      id ${USE_POSTGRES ? "SERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY AUTOINCREMENT"},
+      key_code TEXT UNIQUE NOT NULL,
+      created_at ${USE_POSTGRES ? "TIMESTAMPTZ" : "TEXT"} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      expires_at ${USE_POSTGRES ? "TIMESTAMPTZ" : "TEXT"},
+      expires_after_hours REAL,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      max_devices INTEGER NOT NULL DEFAULT 1,
+      product TEXT NOT NULL DEFAULT 'default',
+      script_url TEXT NOT NULL DEFAULT '',
+      notes TEXT NOT NULL DEFAULT ''
+    )
+  `);
+  await ensureColumn("license_keys", "product", "TEXT NOT NULL DEFAULT 'default'");
+  await ensureColumn("license_keys", "script_url", "TEXT NOT NULL DEFAULT ''");
+  await ensureColumn("license_keys", "expires_after_hours", "REAL");
+  await run(`
+    CREATE TABLE IF NOT EXISTS key_devices (
+      id ${USE_POSTGRES ? "SERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY AUTOINCREMENT"},
+      key_id INTEGER NOT NULL,
+      device_hash TEXT NOT NULL,
+      user_id TEXT,
+      activated_at ${USE_POSTGRES ? "TIMESTAMPTZ" : "TEXT"} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      last_validated_at ${USE_POSTGRES ? "TIMESTAMPTZ" : "TEXT"} NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      activation_ip TEXT,
+      last_ip TEXT,
+      validation_count INTEGER NOT NULL DEFAULT 1,
+      active INTEGER NOT NULL DEFAULT 1,
+      UNIQUE(key_id, device_hash),
+      FOREIGN KEY(key_id) REFERENCES license_keys(id) ON DELETE CASCADE
+    )
+  `);
+  await ensureColumn("key_devices", "activation_ip", "TEXT");
+  await ensureColumn("key_devices", "last_ip", "TEXT");
+  await run(`
+    CREATE TABLE IF NOT EXISTS device_blacklist (
+      id ${USE_POSTGRES ? "SERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY AUTOINCREMENT"},
+      device_hash TEXT UNIQUE NOT NULL,
+      reason TEXT NOT NULL DEFAULT '',
+      banned_at ${USE_POSTGRES ? "TIMESTAMPTZ" : "TEXT"} NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await run(`
+    CREATE TABLE IF NOT EXISTS usage_logs (
+      id ${USE_POSTGRES ? "SERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY AUTOINCREMENT"},
+      key_code TEXT,
+      device_hash TEXT,
+      user_id TEXT,
+      ip TEXT,
+      action TEXT NOT NULL,
+      details TEXT,
+      timestamp ${USE_POSTGRES ? "TIMESTAMPTZ" : "TEXT"} NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+}
+
+async function deleteExpiredKeys() {
+  if (!AUTO_DELETE_EXPIRED_KEYS) {
+    return { changes: 0 };
+  }
+
+  if (deletingExpiredKeys) {
+    return deletingExpiredKeys;
+  }
+
+  const sql = USE_POSTGRES
+    ? "DELETE FROM license_keys WHERE expires_at IS NOT NULL AND expires_at <= NOW()"
+    : "DELETE FROM license_keys WHERE expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now')";
+
+  deletingExpiredKeys = run(sql)
+    .then((result) => ({ changes: Number(result.changes || 0) }))
+    .finally(() => {
+      deletingExpiredKeys = null;
+    });
+
+  return deletingExpiredKeys;
+}
+
+function ensureDbReady() {
+  if (!dbReady || dbInitFailed) {
+    dbInitFailed = false;
+    dbReady = initDatabase().catch((error) => {
+      dbInitFailed = true;
+      throw error;
+    });
+  }
+
+  return dbReady;
+}
+
+async function ensureColumn(tableName, columnName, definition) {
+  if (USE_POSTGRES) {
+    const column = await get(
+      `SELECT column_name
+       FROM information_schema.columns
+       WHERE table_name = ? AND column_name = ?`,
+      [tableName, columnName]
+    );
+
+    if (!column) {
+      await run(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+    }
+    return;
+  }
+
+  const columns = await all(`PRAGMA table_info(${tableName})`);
+  if (!columns.some((column) => column.name === columnName)) {
+    await run(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+  }
+}
+
+function jsonError(res, status, message, code = "error") {
+  return res.status(status).json({ success: false, message, error: message, status: code });
+}
+
+function asyncHandler(handler) {
+  return (req, res, next) => {
+    Promise.resolve(handler(req, res, next)).catch(next);
+  };
+}
+
+function timingSafeEqual(a, b) {
+  const left = Buffer.from(String(a || ""));
+  const right = Buffer.from(String(b || ""));
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function requireAdmin(req, res, next) {
+  const suppliedToken = req.get("x-admin-token") || req.body.adminToken;
+  const adminProduct = ADMIN_PRODUCTS.find((entry) => timingSafeEqual(suppliedToken, entry.token));
+
+  if (!adminProduct) {
+    return jsonError(res, 403, "Unauthorized", "unauthorized");
+  }
+
+  req.adminProduct = adminProduct.product;
+  req.adminProductName = adminProduct.name;
+  req.adminDefaultScriptUrl = adminProduct.defaultScriptUrl;
+  return next();
+}
+
+function requireDiscordBot(req, res, next) {
+  const auth = String(req.get("authorization") || "");
+  const bearerToken = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
+  const suppliedToken = req.get("x-discord-bot-token") || req.get("x-admin-token") || req.body.discordBotToken || bearerToken;
+  const routeProduct = normalizeProduct(req.discordProduct || req.body.product);
+  const productAdmin = routeProduct ? ADMIN_PRODUCTS.find((entry) => entry.product === routeProduct) : null;
+  const isDiscordToken = DISCORD_BOT_API_TOKEN ? timingSafeEqual(suppliedToken, DISCORD_BOT_API_TOKEN) : false;
+  const isProductAdminToken = productAdmin ? timingSafeEqual(suppliedToken, productAdmin.token) : false;
+
+  if (!isDiscordToken && !isProductAdminToken) {
+    return jsonError(res, 403, "Unauthorized", "unauthorized");
+  }
+
+  return next();
+}
+
+function setDiscordProduct(product) {
+  return (req, _res, next) => {
+    req.discordProduct = product;
+    next();
+  };
+}
+
+function normalizeKey(value) {
+  return String(value || "").trim().toUpperCase();
+}
+
+function normalizeProduct(value) {
+  const product = String(value || "").trim();
+  return ADMIN_PRODUCTS.some((entry) => entry.product === product) ? product : null;
+}
+
+function normalizeAdminActor(req) {
+  return String(req.body.adminActor || req.body.actor || req.get("x-admin-actor") || req.adminProductName || "dashboard")
+    .trim()
+    .slice(0, 120);
+}
+
+function normalizeDeviceId(req) {
+  return String(req.body.deviceId || req.body.hwid || "").trim();
+}
+
+function normalizeDiscordActor(req) {
+  return String(req.body.discordUserId || req.body.userId || req.body.user || "discord-bot")
+    .trim()
+    .slice(0, 120);
+}
+
+function isLocalHostname(hostname) {
+  const host = hostname.toLowerCase();
+  return host === "localhost" || host === "127.0.0.1" || host === "::1" || host.endsWith(".localhost");
+}
+
+function getPublicBaseUrl(req) {
+  const configured = process.env.PUBLIC_BASE_URL || process.env.VERCEL_PROJECT_PRODUCTION_URL;
+  if (configured) {
+    return configured.startsWith("http") ? configured.replace(/\/+$/, "") : `https://${configured.replace(/\/+$/, "")}`;
+  }
+  return `${req.protocol}://${req.get("host")}`;
+}
+
+function normalizeScriptUrl(value) {
+  const scriptUrl = String(value || DEFAULT_SCRIPT_URL || "").trim();
+  if (!scriptUrl) return "";
+
+  let parsed;
+  try {
+    parsed = new URL(scriptUrl);
+  } catch (_error) {
+    throw Object.assign(new Error("Script URL must be a valid URL"), { statusCode: 400, status: "invalid_script_url" });
+  }
+
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw Object.assign(new Error("Script URL must use http or https"), { statusCode: 400, status: "invalid_script_url" });
+  }
+
+  if (parsed.protocol !== "https:" && !ALLOW_INSECURE_SCRIPT_URLS && !isLocalHostname(parsed.hostname)) {
+    throw Object.assign(new Error("Script URL must use https"), { statusCode: 400, status: "insecure_script_url" });
+  }
+
+  if (SCRIPT_URL_ALLOWLIST.length && !SCRIPT_URL_ALLOWLIST.includes(parsed.hostname.toLowerCase())) {
+    throw Object.assign(new Error("Script URL host is not allowed"), { statusCode: 400, status: "script_host_not_allowed" });
+  }
+
+  return parsed.toString();
+}
+
+function buildLoadstring(baseUrl, keyCode, product) {
+  const loaderUrl = `${baseUrl.replace(/\/+$/, "")}/api/loader`;
+  const productPrefix = product ? `script_product="${product}"; ` : "";
+  return `${productPrefix}script_key="${keyCode}"; loadstring(game:HttpGet("${loaderUrl}", true))()`;
+}
+
+function getAdminProduct(product, defaultProduct = "ghost_t") {
+  const normalizedProduct = normalizeProduct(product) || defaultProduct;
+  return ADMIN_PRODUCTS.find((entry) => entry.product === normalizedProduct) || ADMIN_PRODUCTS[0];
+}
+
+function normalizeDiscordRole(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function getDiscordRolePlan(req) {
+  const aliases = {
+    w: "week",
+    wweek: "week",
+    week: "week",
+    weekly: "week",
+    "1week": "week",
+    m: "month",
+    mmonth: "month",
+    month: "month",
+    monthly: "month",
+    "1month": "month",
+    "3m": "3months",
+    "3m3months": "3months",
+    threemonths: "3months",
+    "3month": "3months",
+    "3months": "3months",
+    "90days": "3months",
+    lt: "lifetime",
+    ltlifetime: "lifetime",
+    ltlife: "lifetime",
+    lifetime: "lifetime",
+    life: "lifetime",
+    forever: "lifetime",
+  };
+  const priority = ["lifetime", "3months", "month", "week"];
+  const rawRoles = Array.isArray(req.body.roles) ? req.body.roles : [];
+  const candidates = [
+    req.body.plan,
+    req.body.role,
+    req.body.roleName,
+    ...rawRoles.map((role) => (
+      typeof role === "string" ? role : role && (role.name || role.id || role.role || role.roleName)
+    )),
+  ];
+  const plans = candidates
+    .map((candidate) => aliases[normalizeDiscordRole(candidate)])
+    .filter(Boolean);
+
+  return priority.find((plan) => plans.includes(plan)) || null;
+}
+
+function getDiscordPlanRole(plan) {
+  const roles = {
+    week: "(w)-week",
+    month: "(m)-month",
+    "3months": "(3m)-3 months",
+    lifetime: "(Lt)-life time",
+  };
+  return roles[plan] || "";
+}
+
+function getDiscordAccessActions({ plan, expiresAt, isRedeemed = false }) {
+  return {
+    sourceRole: getDiscordPlanRole(plan),
+    grantRole: isRedeemed ? "private user" : null,
+    hideRedeemButton: Boolean(isRedeemed),
+    removeSourceRoleAt: expiresAt || null,
+    removePrivateUserRoleAt: expiresAt || null,
+  };
+}
+
+function getPlanFromKeyRow(keyRow) {
+  const hours = Number(keyRow && keyRow.expires_after_hours);
+  if (!Number.isFinite(hours) || hours <= 0) return "lifetime";
+  if (hours <= 7 * 24) return "week";
+  if (hours <= 30 * 24) return "month";
+  if (hours <= 90 * 24) return "3months";
+  return "lifetime";
+}
+
+function getDiscordPlanDuration(plan) {
+  const durations = {
+    week: 7 * 24,
+    month: 30 * 24,
+    "3months": 90 * 24,
+    lifetime: null,
+  };
+  return Object.prototype.hasOwnProperty.call(durations, plan) ? durations[plan] : undefined;
+}
+
+async function createLicenseKey({ product, scriptUrl, expiresAfterHours, maxDevices, notes, ip, actor }) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const keyCode = generateKey();
+    try {
+      await run(
+        `INSERT INTO license_keys (key_code, expires_at, expires_after_hours, max_devices, product, script_url, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [keyCode, null, expiresAfterHours, maxDevices, product, scriptUrl, notes]
+      );
+      await logUsage({
+        keyCode,
+        ip,
+        action: "KEY_GENERATED",
+        details: JSON.stringify({ maxDevices, expiresAfterHours, scriptUrl, product, adminActor: actor }),
+      });
+      return keyCode;
+    } catch (error) {
+      if (!isUniqueError(error)) throw error;
+    }
+  }
+
+  return null;
+}
+
+function hashDeviceId(deviceId) {
+  return crypto
+    .createHmac("sha256", DEVICE_HASH_SECRET)
+    .update(deviceId)
+    .digest("hex");
+}
+
+function generateKey() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const groups = [];
+
+  for (let group = 0; group < 5; group += 1) {
+    let part = "";
+    for (let index = 0; index < 5; index += 1) {
+      part += chars[crypto.randomInt(chars.length)];
+    }
+    groups.push(part);
+  }
+
+  return `KEY-${groups.join("-")}`;
+}
+
+function isUniqueError(error) {
+  const message = String(error && error.message ? error.message : "").toLowerCase();
+  return error && (error.code === "23505" || message.includes("unique") || message.includes("duplicate"));
+}
+
+async function logUsage({ keyCode, deviceHash, userId, ip, action, details }) {
+  await run(
+    `INSERT INTO usage_logs (key_code, device_hash, user_id, ip, action, details)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [keyCode || null, deviceHash || null, userId || null, ip || null, action, details || null]
+  );
+}
+
+async function getActiveDeviceCount(keyId) {
+  const row = await get(
+    "SELECT COUNT(*) AS count FROM key_devices WHERE key_id = ? AND active = 1",
+    [keyId]
+  );
+  return row ? row.count : 0;
+}
+
+function isExpired(keyRow) {
+  return keyRow.expires_at && Date.now() > new Date(keyRow.expires_at).getTime();
+}
+
+async function startKeyTimerOnBind(keyRow) {
+  const expiresAfterHours = Number(keyRow.expires_after_hours || 0);
+  if (keyRow.expires_at || !Number.isFinite(expiresAfterHours) || expiresAfterHours <= 0) {
+    return keyRow.expires_at || null;
+  }
+
+  const expiresAt = new Date(Date.now() + expiresAfterHours * 60 * 60 * 1000).toISOString();
+  await run("UPDATE license_keys SET expires_at = ? WHERE id = ? AND expires_at IS NULL", [expiresAt, keyRow.id]);
+  keyRow.expires_at = expiresAt;
+  return expiresAt;
+}
+
+function executionIpsSelectSql() {
+  if (USE_POSTGRES) {
+    return "STRING_AGG(DISTINCT CASE WHEN kd.active = 1 THEN kd.last_ip ELSE NULL END, ',') AS execution_ips";
+  }
+
+  return "GROUP_CONCAT(DISTINCT CASE WHEN kd.active = 1 THEN kd.last_ip END) AS execution_ips";
+}
+
+function blacklistedDevicesSelectSql() {
+  return "SUM(CASE WHEN dbl.id IS NOT NULL THEN 1 ELSE 0 END) AS blacklisted_count";
+}
+
+async function validateKeyForDevice({ keyCode, deviceId, userId, ip, product }) {
+  if (!keyCode || !deviceId) {
+    return { ok: false, status: 400, message: "Missing key or device ID", code: "missing_fields" };
+  }
+
+  const deviceHash = hashDeviceId(deviceId);
+  const currentIp = ip ? String(ip) : null;
+
+  const blacklisted = await get("SELECT id FROM device_blacklist WHERE device_hash = ?", [deviceHash]);
+  if (blacklisted) {
+    await logUsage({ keyCode, deviceHash, userId, ip, action: "BLACKLISTED_DEVICE" });
+    return { ok: false, status: 403, message: "This device is blacklisted", code: "blacklisted" };
+  }
+
+  const normalizedProduct = normalizeProduct(product);
+  let keyRow = normalizedProduct
+    ? await get("SELECT * FROM license_keys WHERE key_code = ? AND product = ?", [keyCode, normalizedProduct])
+    : await get("SELECT * FROM license_keys WHERE key_code = ?", [keyCode]);
+
+  if (!keyRow && normalizedProduct) {
+    keyRow = await get("SELECT * FROM license_keys WHERE key_code = ?", [keyCode]);
+  }
+  if (!keyRow) {
+    await logUsage({ keyCode, deviceHash, userId, ip, action: "INVALID_KEY" });
+    return { ok: false, status: 404, message: "Invalid key", code: "invalid" };
+  }
+
+  if (!keyRow.is_active) {
+    await logUsage({ keyCode, deviceHash, userId, ip, action: "INACTIVE_KEY" });
+    return { ok: false, status: 403, message: "Key is inactive", code: "inactive" };
+  }
+
+  if (isExpired(keyRow)) {
+    await logUsage({ keyCode, deviceHash, userId, ip, action: "EXPIRED_KEY" });
+    return { ok: false, status: 403, message: "Key has expired", code: "expired" };
+  }
+
+  const activation = await get(
+    "SELECT * FROM key_devices WHERE key_id = ? AND device_hash = ? AND active = 1",
+    [keyRow.id, deviceHash]
+  );
+
+  if (activation) {
+    const expiresAt = await startKeyTimerOnBind(keyRow);
+    await run(
+      `UPDATE key_devices
+       SET user_id = COALESCE(?, user_id),
+           activation_ip = COALESCE(activation_ip, ?),
+           last_validated_at = CURRENT_TIMESTAMP,
+           last_ip = ?,
+           validation_count = validation_count + 1
+       WHERE id = ?`,
+      [userId, currentIp, currentIp, activation.id]
+    );
+    await logUsage({ keyCode, deviceHash, userId, ip, action: "KEY_VALIDATED" });
+    return { ok: true, keyRow: { ...keyRow, expires_at: expiresAt }, deviceHash, statusText: "validated", isNew: false };
+  }
+
+  const activeDeviceCount = await getActiveDeviceCount(keyRow.id);
+  if (activeDeviceCount >= keyRow.max_devices) {
+    await logUsage({ keyCode, deviceHash, userId, ip, action: "MAX_DEVICES_REACHED" });
+    return { ok: false, status: 403, message: "Key device limit reached", code: "max_uses" };
+  }
+
+  await run(
+    `INSERT INTO key_devices (key_id, device_hash, user_id, activation_ip, last_ip)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(key_id, device_hash)
+     DO UPDATE SET active = 1,
+                   user_id = excluded.user_id,
+                   activation_ip = COALESCE(key_devices.activation_ip, excluded.activation_ip),
+                   last_validated_at = CURRENT_TIMESTAMP,
+                   last_ip = excluded.last_ip,
+                   validation_count = key_devices.validation_count + 1`,
+    [keyRow.id, deviceHash, userId, currentIp, currentIp]
+  );
+  const expiresAt = await startKeyTimerOnBind(keyRow);
+  await logUsage({ keyCode, deviceHash, userId, ip, action: "KEY_ACTIVATED" });
+  return { ok: true, keyRow: { ...keyRow, expires_at: expiresAt }, deviceHash, statusText: "activated", isNew: true };
+}
+
+async function fetchScriptContent(scriptUrl) {
+  const safeScriptUrl = normalizeScriptUrl(scriptUrl);
+  if (!safeScriptUrl) {
+    throw Object.assign(new Error("No script URL is configured for this key"), {
+      statusCode: 500,
+      status: "missing_script_url",
+    });
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+
+  try {
+    const response = await fetch(safeScriptUrl, {
+      signal: controller.signal,
+      headers: { "User-Agent": "key-system-loader/1.0" },
+    });
+
+    if (!response.ok) {
+      throw Object.assign(new Error(`Script fetch failed with ${response.status}`), {
+        statusCode: 502,
+        status: "script_fetch_failed",
+      });
+    }
+
+    const contentLength = Number(response.headers.get("content-length") || 0);
+    if (contentLength > MAX_SCRIPT_BYTES) {
+      throw Object.assign(new Error("Script is too large"), {
+        statusCode: 413,
+        status: "script_too_large",
+      });
+    }
+
+    const script = await response.text();
+    if (Buffer.byteLength(script, "utf8") > MAX_SCRIPT_BYTES) {
+      throw Object.assign(new Error("Script is too large"), {
+        statusCode: 413,
+        status: "script_too_large",
+      });
+    }
+
+    return script;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function buildLuaLoader(req) {
+  const apiUrl = `${getPublicBaseUrl(req)}/api/loader`;
+  return `-- Delta key loader
+local API_URL = "${apiUrl}"
+local MAX_RETRIES = 3
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+
+local function notify(title, text)
+  pcall(function()
+    game:GetService("StarterGui"):SetCore("SendNotification", {
+      Title = title,
+      Text = text,
+      Duration = 5
+    })
+  end)
+end
+
+local function getDeviceId()
+  if syn and syn.crypt and syn.crypt.hwid then
+    local ok, value = pcall(syn.crypt.hwid)
+    if ok and value then return tostring(value) end
+  end
+
+  local clientId = "unknown"
+  pcall(function()
+    clientId = game:GetService("RbxAnalyticsService"):GetClientId()
+  end)
+
+  local executor = "executor"
+  pcall(function()
+    if getexecutorname then
+      executor = tostring(getexecutorname())
+    end
+  end)
+
+  return executor .. "-" .. tostring(clientId)
+end
+
+local function request(requestData)
+  local requester = (syn and syn.request) or http_request or request or (http and http.request)
+  if requester then
+    return requester(requestData)
+  end
+
+  return HttpService:RequestAsync(requestData)
+end
+
+local function validate()
+  local key = script_key or _G.script_key or shared.script_key
+  local product = script_product or _G.script_product or shared.script_product
+  if not key or tostring(key) == "" then
+    return false, "Missing script key"
+  end
+
+  local player = Players.LocalPlayer
+  local body = HttpService:JSONEncode({
+    key = tostring(key),
+    product = product and tostring(product) or nil,
+    hwid = getDeviceId(),
+    userId = player and tostring(player.UserId) or nil
+  })
+
+  for attempt = 1, MAX_RETRIES do
+    local ok, response = pcall(request, {
+      Url = API_URL,
+      Method = "POST",
+      Headers = { ["Content-Type"] = "application/json" },
+      Body = body
+    })
+
+    if ok and response then
+      local statusCode = response.StatusCode or response.status_code or response.Status or 200
+      local responseBody = response.Body or response.body or ""
+      local decodedOk, decoded = pcall(function()
+        return HttpService:JSONDecode(responseBody)
+      end)
+
+      if decodedOk and decoded then
+        if decoded.success and decoded.script then
+          return true, decoded.script
+        end
+        return false, decoded.message or decoded.error or "Key validation failed"
+      end
+
+      if statusCode >= 200 and statusCode < 300 and responseBody ~= "" then
+        return true, responseBody
+      end
+
+      return false, "Invalid response from key server"
+    end
+
+    if attempt < MAX_RETRIES then
+      task.wait(1)
+    end
+  end
+
+  return false, "Could not reach key server"
+end
+
+local ok, result = validate()
+if not ok then
+  warn("[Delta Loader] " .. tostring(result))
+  notify("Key validation failed", tostring(result))
+  return
+end
+
+local function runScript(source)
+  if loadfile and writefile then
+    local folder = "DeltaKeySystem"
+    local path = folder .. "/payload.lua"
+
+    pcall(function()
+      if makefolder and (not isfolder or not isfolder(folder)) then
+        makefolder(folder)
+      end
+    end)
+
+    local wrote = pcall(function()
+      writefile(path, source)
+    end)
+
+    if wrote then
+      local fileFn, fileErr = loadfile(path)
+      if fileFn then
+        return pcall(fileFn)
+      end
+      warn("[Delta Loader] loadfile failed: " .. tostring(fileErr))
+    end
+  end
+
+  local fn, err = loadstring(source)
+  if not fn then
+    return false, err
+  end
+
+  return pcall(fn)
+end
+
+local ran, runErr = runScript(result)
+if not ran then
+  warn("[Delta Loader] " .. tostring(runErr))
+  notify("Script error", tostring(runErr))
+end
+`;
+}
+
+app.use((req, res, next) => {
+  if (req.path === "/api/health") {
+    return next();
+  }
+
+  return ensureDbReady()
+    .then(() => deleteExpiredKeys())
+    .then(() => next())
+    .catch(next);
+});
+
+app.get("/api/health", (_req, res) => {
+  res.json({ success: true, status: "ok", database: USE_POSTGRES ? "postgres" : "sqlite" });
+});
+
+app.post("/api/generate-key", requireAdmin, asyncHandler(async (req, res) => {
+  const requestedExpiresIn = req.body.expiresIn !== undefined ? req.body.expiresIn : req.body.expiresInDays;
+  const expiresIn = Math.max(0, Number(requestedExpiresIn || 0));
+  const expiresInUnit = String(req.body.expiresInUnit || (req.body.expiresInHours !== undefined ? "hours" : "days")).toLowerCase();
+  const isLifetime = expiresInUnit === "lifetime";
+  const expiresInHours = req.body.expiresInHours !== undefined
+    ? Math.max(0, Number(req.body.expiresInHours || 0))
+    : expiresIn * (expiresInUnit === "hours" ? 1 : 24);
+  const maxDevices = Math.max(1, Number(req.body.maxUses || req.body.maxDevices || 1));
+  const notes = String(req.body.notes || "").slice(0, 500);
+  const adminActor = normalizeAdminActor(req);
+  const scriptUrl = normalizeScriptUrl(req.body.scriptUrl || req.adminDefaultScriptUrl);
+  if (!scriptUrl) {
+    return jsonError(res, 400, "Missing script URL", "missing_script_url");
+  }
+  const expiresAfterHours = !isLifetime && expiresInHours > 0 ? expiresInHours : null;
+
+  const keyCode = await createLicenseKey({
+    product: req.adminProduct,
+    scriptUrl,
+    expiresAfterHours,
+    maxDevices,
+    notes,
+    ip: req.ip,
+    actor: adminActor,
+  });
+
+  if (keyCode) {
+    return res.json({
+      success: true,
+      product: req.adminProduct,
+      productName: req.adminProductName,
+      key: keyCode,
+      expiresAt: null,
+      expiresAfterHours,
+      maxUses: maxDevices,
+      scriptUrl,
+      loadstring: buildLoadstring(getPublicBaseUrl(req), keyCode, req.adminProduct),
+    });
+  }
+
+  return jsonError(res, 500, "Could not generate a unique key", "generation_failed");
+}));
+
+app.post("/api/validate-key", asyncHandler(async (req, res) => {
+  const keyCode = normalizeKey(req.body.key);
+  const deviceId = normalizeDeviceId(req);
+  const userId = req.body.userId ? String(req.body.userId).slice(0, 128) : null;
+  const product = req.body.product;
+  const ip = req.ip;
+
+  const result = await validateKeyForDevice({ keyCode, deviceId, userId, ip, product });
+  if (!result.ok) {
+    return jsonError(res, result.status, result.message, result.code);
+  }
+
+  return res.json({
+    success: true,
+    message: result.isNew ? "Key activated successfully" : "Key validated successfully",
+    status: result.statusText,
+    isNew: result.isNew,
+    expiresAt: result.keyRow.expires_at,
+    serverTime: new Date().toISOString(),
+  });
+}));
+
+app.get("/api/loader", (req, res) => {
+  res.set("Cache-Control", "no-store, max-age=0");
+  res.type("text/plain").send(buildLuaLoader(req));
+});
+
+app.post("/api/loader", asyncHandler(async (req, res) => {
+  const keyCode = normalizeKey(req.body.key);
+  const deviceId = normalizeDeviceId(req);
+  const userId = req.body.userId ? String(req.body.userId).slice(0, 128) : null;
+  const result = await validateKeyForDevice({ keyCode, deviceId, userId, ip: req.ip, product: req.body.product });
+
+  if (!result.ok) {
+    return jsonError(res, result.status, result.message, result.code);
+  }
+
+  const script = await fetchScriptContent(result.keyRow.script_url);
+  res.set("Cache-Control", "no-store, max-age=0");
+  await logUsage({
+    keyCode,
+    deviceHash: result.deviceHash,
+    userId,
+    ip: req.ip,
+    action: "SCRIPT_DELIVERED",
+    details: JSON.stringify({ bytes: Buffer.byteLength(script, "utf8") }),
+  });
+  return res.type("text/plain").send(script);
+}));
+
+app.post(["/api/reset-hwid", "/api/reset-device"], requireAdmin, asyncHandler(async (req, res) => {
+  const keyCode = normalizeKey(req.body.key);
+  const deviceId = normalizeDeviceId(req);
+  const adminActor = normalizeAdminActor(req);
+
+  if (!keyCode) {
+    return jsonError(res, 400, "Missing key", "missing_key");
+  }
+
+  const keyRow = await get("SELECT * FROM license_keys WHERE key_code = ? AND product = ?", [keyCode, req.adminProduct]);
+  if (!keyRow) {
+    return jsonError(res, 404, "Key not found", "not_found");
+  }
+
+  let result;
+  if (deviceId) {
+    const deviceHash = hashDeviceId(deviceId);
+    result = await run(
+      "UPDATE key_devices SET active = 0 WHERE key_id = ? AND device_hash = ?",
+      [keyRow.id, deviceHash]
+    );
+    await logUsage({ keyCode, deviceHash, ip: req.ip, action: "DEVICE_RESET", details: JSON.stringify({ adminActor }) });
+  } else {
+    result = await run("UPDATE key_devices SET active = 0 WHERE key_id = ?", [keyRow.id]);
+    await logUsage({ keyCode, ip: req.ip, action: "ALL_DEVICES_RESET", details: JSON.stringify({ adminActor }) });
+  }
+
+  return res.json({
+    success: true,
+    message: "Device binding reset successfully",
+    changed: result.changes,
+  });
+}));
+
+const discordGetKey = asyncHandler(async (req, res) => {
+  const plan = getDiscordRolePlan(req);
+  if (!plan) {
+    return jsonError(res, 400, "Missing Discord role plan. Use week, month, 3months, or lifetime.", "missing_role_plan");
+  }
+
+  const expiresAfterHours = getDiscordPlanDuration(plan);
+  if (expiresAfterHours === undefined) {
+    return jsonError(res, 400, "Unsupported Discord role plan", "unsupported_role_plan");
+  }
+
+  const adminProduct = getAdminProduct(req.discordProduct || req.body.product);
+  const scriptUrl = normalizeScriptUrl(req.body.scriptUrl || adminProduct.defaultScriptUrl);
+  if (!scriptUrl) {
+    return jsonError(res, 400, "Missing script URL", "missing_script_url");
+  }
+
+  const maxDevices = Math.max(1, Number(req.body.maxUses || req.body.maxDevices || 1));
+  const actor = normalizeDiscordActor(req);
+  const notes = String(req.body.notes || `Discord ${plan} key for ${actor}`).slice(0, 500);
+  const keyCode = await createLicenseKey({
+    product: adminProduct.product,
+    scriptUrl,
+    expiresAfterHours,
+    maxDevices,
+    notes,
+    ip: req.ip,
+    actor,
+  });
+
+  if (!keyCode) {
+    return jsonError(res, 500, "Could not generate a unique key", "generation_failed");
+  }
+
+  return res.json({
+    success: true,
+    plan,
+    sourceRole: getDiscordPlanRole(plan),
+    product: adminProduct.product,
+    productName: adminProduct.name,
+    key: keyCode,
+    expiresAt: null,
+    expiresAfterHours,
+    maxUses: maxDevices,
+    scriptUrl,
+    loadstring: buildLoadstring(getPublicBaseUrl(req), keyCode, adminProduct.product),
+    discordAccess: getDiscordAccessActions({ plan, expiresAt: null, isRedeemed: false }),
+  });
+});
+
+const discordRedeemKey = asyncHandler(async (req, res) => {
+  const keyCode = normalizeKey(req.body.key);
+  const deviceId = normalizeDeviceId(req);
+  const userId = (req.body.discordUserId || req.body.userId) ? String(req.body.discordUserId || req.body.userId).slice(0, 128) : null;
+  const result = await validateKeyForDevice({
+    keyCode,
+    deviceId,
+    userId,
+    ip: req.ip,
+    product: req.discordProduct || req.body.product || "ghost_t",
+  });
+
+  if (!result.ok) {
+    return jsonError(res, result.status, result.message, result.code);
+  }
+
+  return res.json({
+    success: true,
+    message: result.isNew ? "Key redeemed successfully" : "Key already redeemed on this device",
+    status: result.statusText,
+    isNew: result.isNew,
+    expiresAt: result.keyRow.expires_at,
+    expiresAfterHours: result.keyRow.expires_after_hours,
+    plan: getPlanFromKeyRow(result.keyRow),
+    product: result.keyRow.product || "default",
+    discordAccess: getDiscordAccessActions({
+      plan: getPlanFromKeyRow(result.keyRow),
+      expiresAt: result.keyRow.expires_at,
+      isRedeemed: true,
+    }),
+    serverTime: new Date().toISOString(),
+  });
+});
+
+const discordResetHwid = asyncHandler(async (req, res) => {
+  const keyCode = normalizeKey(req.body.key);
+  const deviceId = normalizeDeviceId(req);
+  const adminProduct = getAdminProduct(req.discordProduct || req.body.product);
+  const actor = normalizeDiscordActor(req);
+
+  if (!keyCode) {
+    return jsonError(res, 400, "Missing key", "missing_key");
+  }
+
+  const keyRow = await get("SELECT * FROM license_keys WHERE key_code = ? AND product = ?", [keyCode, adminProduct.product]);
+  if (!keyRow) {
+    return jsonError(res, 404, "Key not found", "not_found");
+  }
+
+  let result;
+  if (deviceId) {
+    const deviceHash = hashDeviceId(deviceId);
+    result = await run(
+      "UPDATE key_devices SET active = 0 WHERE key_id = ? AND device_hash = ?",
+      [keyRow.id, deviceHash]
+    );
+    await logUsage({ keyCode, deviceHash, ip: req.ip, action: "DISCORD_DEVICE_RESET", details: JSON.stringify({ adminActor: actor }) });
+  } else {
+    result = await run("UPDATE key_devices SET active = 0 WHERE key_id = ?", [keyRow.id]);
+    await logUsage({ keyCode, ip: req.ip, action: "DISCORD_ALL_DEVICES_RESET", details: JSON.stringify({ adminActor: actor }) });
+  }
+
+  return res.json({
+    success: true,
+    message: "Device binding reset successfully",
+    changed: result.changes,
+  });
+});
+
+const discordGetScript = asyncHandler(async (req, res) => {
+  const keyCode = normalizeKey(req.body.key);
+  const product = normalizeProduct(req.discordProduct || req.body.product || "ghost_t");
+
+  if (!keyCode) {
+    return jsonError(res, 400, "Missing key", "missing_key");
+  }
+
+  const keyRow = product
+    ? await get("SELECT * FROM license_keys WHERE key_code = ? AND product = ?", [keyCode, product])
+    : await get("SELECT * FROM license_keys WHERE key_code = ?", [keyCode]);
+  if (!keyRow) {
+    return jsonError(res, 404, "Key not found", "not_found");
+  }
+
+  if (!keyRow.is_active) {
+    return jsonError(res, 403, "Key is inactive", "inactive");
+  }
+
+  if (isExpired(keyRow)) {
+    return jsonError(res, 403, "Key has expired", "expired");
+  }
+
+  const activeDeviceCount = await getActiveDeviceCount(keyRow.id);
+  const plan = getPlanFromKeyRow(keyRow);
+
+  return res.json({
+    success: true,
+    key: keyRow.key_code,
+    product: keyRow.product || "default",
+    scriptUrl: keyRow.script_url || "",
+    loaderUrl: `${getPublicBaseUrl(req)}/api/loader`,
+    loadstring: buildLoadstring(getPublicBaseUrl(req), keyRow.key_code, keyRow.product || "default"),
+    expiresAt: keyRow.expires_at,
+    expiresAfterHours: keyRow.expires_after_hours,
+    plan,
+    redeemed: activeDeviceCount > 0,
+    discordAccess: getDiscordAccessActions({
+      plan,
+      expiresAt: keyRow.expires_at,
+      isRedeemed: activeDeviceCount > 0,
+    }),
+  });
+});
+
+app.post("/api/discord/get-key", requireDiscordBot, discordGetKey);
+app.post("/api/discord/redeem-key", requireDiscordBot, discordRedeemKey);
+app.post("/api/discord/reset-hwid", requireDiscordBot, discordResetHwid);
+app.post("/api/discord/get-script", requireDiscordBot, discordGetScript);
+
+app.post("/api/discord/ghostlua/get-key", setDiscordProduct("default"), requireDiscordBot, discordGetKey);
+app.post("/api/discord/ghostlua/redeem-key", setDiscordProduct("default"), requireDiscordBot, discordRedeemKey);
+app.post("/api/discord/ghostlua/reset-hwid", setDiscordProduct("default"), requireDiscordBot, discordResetHwid);
+app.post("/api/discord/ghostlua/get-script", setDiscordProduct("default"), requireDiscordBot, discordGetScript);
+
+app.post("/api/discord/ghost-t/get-key", setDiscordProduct("ghost_t"), requireDiscordBot, discordGetKey);
+app.post("/api/discord/ghost-t/redeem-key", setDiscordProduct("ghost_t"), requireDiscordBot, discordRedeemKey);
+app.post("/api/discord/ghost-t/reset-hwid", setDiscordProduct("ghost_t"), requireDiscordBot, discordResetHwid);
+app.post("/api/discord/ghost-t/get-script", setDiscordProduct("ghost_t"), requireDiscordBot, discordGetScript);
+
+app.post(["/api/blacklist-hwid", "/api/blacklist-device"], requireAdmin, asyncHandler(async (req, res) => {
+  const deviceId = normalizeDeviceId(req);
+  const reason = String(req.body.reason || "No reason provided").slice(0, 500);
+  const adminActor = normalizeAdminActor(req);
+
+  if (!deviceId) {
+    return jsonError(res, 400, "Missing device ID", "missing_device");
+  }
+
+  const deviceHash = hashDeviceId(deviceId);
+  await run(
+    `INSERT INTO device_blacklist (device_hash, reason)
+     VALUES (?, ?)
+     ON CONFLICT(device_hash) DO UPDATE SET reason = excluded.reason,
+                                            banned_at = CURRENT_TIMESTAMP`,
+    [deviceHash, reason]
+  );
+  await run("UPDATE key_devices SET active = 0 WHERE device_hash = ?", [deviceHash]);
+  await logUsage({ deviceHash, ip: req.ip, action: "DEVICE_BLACKLISTED", details: JSON.stringify({ reason, adminActor, product: req.adminProduct }) });
+
+  return res.json({ success: true, message: "Device blacklisted successfully" });
+}));
+
+app.post(["/api/unblacklist-hwid", "/api/unblacklist-device"], requireAdmin, asyncHandler(async (req, res) => {
+  const deviceId = normalizeDeviceId(req);
+  const adminActor = normalizeAdminActor(req);
+
+  if (!deviceId) {
+    return jsonError(res, 400, "Missing device ID", "missing_device");
+  }
+
+  const deviceHash = hashDeviceId(deviceId);
+  const result = await run("DELETE FROM device_blacklist WHERE device_hash = ?", [deviceHash]);
+  await logUsage({ deviceHash, ip: req.ip, action: "DEVICE_UNBLACKLISTED", details: JSON.stringify({ adminActor, product: req.adminProduct }) });
+
+  return res.json({
+    success: true,
+    message: "Device removed from blacklist",
+    changed: result.changes,
+  });
+}));
+
+async function getKeyDevicesForAdmin(keyCode, product) {
+  const keyRow = await get("SELECT * FROM license_keys WHERE key_code = ? AND product = ?", [keyCode, product]);
+  if (!keyRow) {
+    return { keyRow: null, devices: [] };
+  }
+
+  const devices = await all(
+    "SELECT DISTINCT device_hash FROM key_devices WHERE key_id = ?",
+    [keyRow.id]
+  );
+
+  return { keyRow, devices };
+}
+
+app.post("/api/blacklist-key-devices", requireAdmin, asyncHandler(async (req, res) => {
+  const keyCode = normalizeKey(req.body.key);
+  const reason = String(req.body.reason || `Blacklisted from key ${keyCode}`).slice(0, 500);
+  const adminActor = normalizeAdminActor(req);
+
+  if (!keyCode) {
+    return jsonError(res, 400, "Missing key", "missing_key");
+  }
+
+  const { keyRow, devices } = await getKeyDevicesForAdmin(keyCode, req.adminProduct);
+  if (!keyRow) {
+    return jsonError(res, 404, "Key not found", "not_found");
+  }
+
+  for (const device of devices) {
+    await run(
+      `INSERT INTO device_blacklist (device_hash, reason)
+       VALUES (?, ?)
+       ON CONFLICT(device_hash) DO UPDATE SET reason = excluded.reason,
+                                              banned_at = CURRENT_TIMESTAMP`,
+      [device.device_hash, reason]
+    );
+  }
+
+  await run("UPDATE key_devices SET active = 0 WHERE key_id = ?", [keyRow.id]);
+  await logUsage({
+    keyCode,
+    ip: req.ip,
+    action: "KEY_DEVICES_BLACKLISTED",
+    details: JSON.stringify({ count: devices.length, reason, adminActor }),
+  });
+
+  return res.json({
+    success: true,
+    message: devices.length ? "Key devices blacklisted" : "No devices are bound to this key",
+    changed: devices.length,
+  });
+}));
+
+app.post("/api/unblacklist-key-devices", requireAdmin, asyncHandler(async (req, res) => {
+  const keyCode = normalizeKey(req.body.key);
+  const adminActor = normalizeAdminActor(req);
+
+  if (!keyCode) {
+    return jsonError(res, 400, "Missing key", "missing_key");
+  }
+
+  const { keyRow, devices } = await getKeyDevicesForAdmin(keyCode, req.adminProduct);
+  if (!keyRow) {
+    return jsonError(res, 404, "Key not found", "not_found");
+  }
+
+  let changed = 0;
+  for (const device of devices) {
+    const result = await run("DELETE FROM device_blacklist WHERE device_hash = ?", [device.device_hash]);
+    changed += Number(result.changes || 0);
+  }
+
+  await logUsage({
+    keyCode,
+    ip: req.ip,
+    action: "KEY_DEVICES_UNBLACKLISTED",
+    details: JSON.stringify({ count: changed, adminActor }),
+  });
+
+  return res.json({
+    success: true,
+    message: changed ? "Key devices unblacklisted" : "No blacklisted devices found for this key",
+    changed,
+  });
+}));
+
+app.post("/api/key-info", requireAdmin, asyncHandler(async (req, res) => {
+  const keyCode = normalizeKey(req.body.key);
+
+  if (!keyCode) {
+    return jsonError(res, 400, "Missing key", "missing_key");
+  }
+
+  const keyRow = await get(
+    `SELECT lk.*,
+            SUM(CASE WHEN kd.active = 1 THEN 1 ELSE 0 END) AS used_count,
+            ${executionIpsSelectSql()},
+            ${blacklistedDevicesSelectSql()}
+     FROM license_keys lk
+     LEFT JOIN key_devices kd ON kd.key_id = lk.id
+     LEFT JOIN device_blacklist dbl ON dbl.device_hash = kd.device_hash
+     WHERE lk.key_code = ? AND lk.product = ?
+     GROUP BY lk.id`,
+    [keyCode, req.adminProduct]
+  );
+
+  if (!keyRow) {
+    return jsonError(res, 404, "Key not found", "not_found");
+  }
+
+  const devices = await all(
+    `SELECT user_id, activated_at, last_validated_at, activation_ip, last_ip, validation_count, active
+     FROM key_devices
+     WHERE key_id = ?
+     ORDER BY last_validated_at DESC`,
+    [keyRow.id]
+  );
+
+  return res.json({
+    success: true,
+    data: formatKeyRow(keyRow),
+    devices,
+  });
+}));
+
+app.post("/api/all-keys", requireAdmin, asyncHandler(async (_req, res) => {
+  const rows = await all(`
+    SELECT lk.*,
+           SUM(CASE WHEN kd.active = 1 THEN 1 ELSE 0 END) AS used_count,
+           ${executionIpsSelectSql()},
+           ${blacklistedDevicesSelectSql()}
+    FROM license_keys lk
+    LEFT JOIN key_devices kd ON kd.key_id = lk.id
+    LEFT JOIN device_blacklist dbl ON dbl.device_hash = kd.device_hash
+    WHERE lk.product = ?
+    GROUP BY lk.id
+    ORDER BY lk.created_at DESC
+  `, [_req.adminProduct]);
+
+  return res.json({
+    success: true,
+    product: _req.adminProduct,
+    productName: _req.adminProductName,
+    data: rows.map(formatKeyRow),
+  });
+}));
+
+app.post("/api/audit-logs", requireAdmin, asyncHandler(async (req, res) => {
+  const limit = Math.min(200, Math.max(1, Number(req.body.limit || 80)));
+  const rows = await all(`
+    SELECT ul.*
+    FROM usage_logs ul
+    LEFT JOIN license_keys lk ON lk.key_code = ul.key_code
+    WHERE lk.product = ?
+       OR (ul.key_code IS NULL AND ul.details LIKE ?)
+    ORDER BY ul.timestamp DESC
+    LIMIT ?
+  `, [req.adminProduct, `%"product":"${req.adminProduct}"%`, limit]);
+
+  return res.json({
+    success: true,
+    product: req.adminProduct,
+    productName: req.adminProductName,
+    data: rows.map(formatAuditLogRow),
+  });
+}));
+
+app.post("/api/toggle-key", requireAdmin, asyncHandler(async (req, res) => {
+  const keyCode = normalizeKey(req.body.key);
+  const isActive = req.body.isActive ? 1 : 0;
+  const adminActor = normalizeAdminActor(req);
+
+  if (!keyCode) {
+    return jsonError(res, 400, "Missing key", "missing_key");
+  }
+
+  const result = await run(
+    "UPDATE license_keys SET is_active = ? WHERE key_code = ? AND product = ?",
+    [isActive, keyCode, req.adminProduct]
+  );
+  if (!result.changes) {
+    return jsonError(res, 404, "Key not found", "not_found");
+  }
+
+  await logUsage({
+    keyCode,
+    ip: req.ip,
+    action: isActive ? "KEY_ENABLED" : "KEY_DISABLED",
+    details: JSON.stringify({ adminActor }),
+  });
+
+  return res.json({ success: true, message: isActive ? "Key enabled" : "Key disabled" });
+}));
+
+app.post("/api/update-notes", requireAdmin, asyncHandler(async (req, res) => {
+  const keyCode = normalizeKey(req.body.key);
+  const notes = String(req.body.notes || "").slice(0, 500);
+  const adminActor = normalizeAdminActor(req);
+
+  if (!keyCode) {
+    return jsonError(res, 400, "Missing key", "missing_key");
+  }
+
+  const result = await run(
+    "UPDATE license_keys SET notes = ? WHERE key_code = ? AND product = ?",
+    [notes, keyCode, req.adminProduct]
+  );
+  if (!result.changes) {
+    return jsonError(res, 404, "Key not found", "not_found");
+  }
+
+  await logUsage({
+    keyCode,
+    ip: req.ip,
+    action: "KEY_NOTES_UPDATED",
+    details: JSON.stringify({ adminActor }),
+  });
+
+  return res.json({ success: true, message: "Notes updated", notes });
+}));
+
+app.post("/api/delete-key", requireAdmin, asyncHandler(async (req, res) => {
+  const keyCode = normalizeKey(req.body.key);
+  const adminActor = normalizeAdminActor(req);
+
+  if (!keyCode) {
+    return jsonError(res, 400, "Missing key", "missing_key");
+  }
+
+  const result = await run("DELETE FROM license_keys WHERE key_code = ? AND product = ?", [keyCode, req.adminProduct]);
+  if (!result.changes) {
+    return jsonError(res, 404, "Key not found", "not_found");
+  }
+
+  await logUsage({
+    keyCode,
+    ip: req.ip,
+    action: "KEY_DELETED",
+    details: JSON.stringify({ adminActor }),
+  });
+
+  return res.json({ success: true, message: "Key deleted" });
+}));
+
+function formatKeyRow(row) {
+  const executionIps = String(row.execution_ips || "")
+    .split(",")
+    .map((ip) => ip.trim())
+    .filter(Boolean);
+
+  return {
+    id: row.id,
+    key: row.key_code,
+    product: row.product || "default",
+    created_at: row.created_at,
+    expires_at: row.expires_at,
+    expires_after_hours: row.expires_after_hours,
+    timer_pending: !row.expires_at && Number(row.expires_after_hours || 0) > 0,
+    is_active: Boolean(row.is_active),
+    max_uses: row.max_devices,
+    max_devices: row.max_devices,
+    used_count: row.used_count || 0,
+    blacklisted_count: row.blacklisted_count || 0,
+    execution_ips: executionIps,
+    script_url: row.script_url || "",
+    notes: row.notes || "",
+    expired: isExpired(row),
+  };
+}
+
+function formatAuditLogRow(row) {
+  let details = {};
+  if (row.details) {
+    try {
+      details = JSON.parse(row.details);
+    } catch (_error) {
+      details = { note: row.details };
+    }
+  }
+
+  return {
+    id: row.id,
+    key: row.key_code || "",
+    userId: row.user_id || "",
+    ip: row.ip || "",
+    action: row.action,
+    timestamp: row.timestamp,
+    adminActor: details.adminActor || "",
+    reason: details.reason || details.note || "",
+    details,
+  };
+}
+
+app.use((err, _req, res, _next) => {
+  console.error(err);
+  return jsonError(
+    res,
+    err.statusCode || 500,
+    err.statusCode ? err.message : "Internal server error",
+    err.status || "server_error"
+  );
+});
+
+if (require.main === module) {
+  ensureDbReady().then(() => {
+    app.listen(PORT, () => {
+      console.log(`Key system running on http://localhost:${PORT}`);
+    });
+  })
+  .catch((error) => {
+    console.error("Failed to initialize database:", error);
+    process.exit(1);
+  });
+}
+
+module.exports = app;
